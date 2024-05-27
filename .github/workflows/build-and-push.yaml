@@ -1,0 +1,126 @@
+name: Build Docker Image
+
+on:
+  push:
+    branches: main
+
+env:
+  REGISTRY: ghcr.io
+  GHCR_CONTAINER_PATH: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    env:
+      PLATFORMS: "['linux/amd64', 'linux/amd64/v3', 'linux/arm64']"
+
+    outputs:
+      platforms: ${{ steps.extract-binaries.outputs.PLTF }}
+      source-version: ${{ steps.extract-binaries.outputs.SOURCE_VERSION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_CONTAINER_PATH }}
+          tags: type=raw,value=latest
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure build platforms
+        shell: bash
+        run: |
+          PLATFORMS=$(echo "${{ env.PLATFORMS }}" | tr -d "[' ]")
+          echo "BUILD_PLATFORMS=$PLATFORMS" | tee -a "${GITHUB_ENV}"
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ env.BUILD_PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=local,dest=/tmp/xcaddy
+
+      - name: Check for extracted binaries
+        id: extract-binaries
+        run: |
+          PLATFORMS=$(echo "${{ env.PLATFORMS }}" | tr '/' '_')
+          echo "PLTF=$PLATFORMS" | tee -a "$GITHUB_OUTPUT"
+          echo "SOURCE_VERSION=$(git rev-parse --short HEAD)" | tee -a "${GITHUB_OUTPUT}"
+
+      - name: Binary cache between jobs
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/xcaddy/
+          key: xcaddy-binaries-${{ steps.extract-binaries.outputs.SOURCE_VERSION }}
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.GHCR_CONTAINER_PATH }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: 'spdx-json'
+          output-file: 'sbom.spdx.json'
+          upload-artifact: false
+
+      - name: Generate SBOM attestation
+        uses: actions/attest-sbom@v1
+        with:
+          subject-name: ${{ env.GHCR_CONTAINER_PATH }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: 'sbom.spdx.json'
+          push-to-registry: true
+
+  upload-binaries:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    strategy:
+      matrix:
+        platforms: ${{ fromJSON(needs.build-and-push.outputs.platforms) }}
+
+    steps:
+      - name: Binary cache between jobs
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/xcaddy/
+          key: xcaddy-binaries-${{ needs.build-and-push.outputs.source-version }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcaddy-${{ needs.build-and-push.outputs.source-version }}-${{ matrix.platforms }}
+          path: /tmp/xcaddy/${{ matrix.platforms }}/usr/bin/caddy
