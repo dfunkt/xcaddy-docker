@@ -1,5 +1,5 @@
 FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
-FROM --platform=$BUILDPLATFORM caddy:2.8.4-builder AS builder
+FROM --platform=$BUILDPLATFORM caddy:2.10.2-builder AS builder
 COPY --from=xx / /
 
 RUN apk add --no-cache bash
@@ -21,6 +21,6 @@ RUN if [[ "${TARGETARCH}${TARGETVARIANT}" == amd64v* ]]; then \
       --with github.com/caddy-dns/cloudflare \
       --with github.com/mholt/caddy-dynamicdns
 
-FROM caddy:2.8.4-alpine
+FROM caddy:2.10.2-alpine
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
