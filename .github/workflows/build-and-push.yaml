@@ -1,126 +1,181 @@
 name: Build Docker Image
+permissions: {}
 
 on:
   push:
     branches: main
 
 env:
-  REGISTRY: ghcr.io
-  GHCR_CONTAINER_PATH: ghcr.io/${{ github.repository }}
+  REGISTRY_PACKAGE: ghcr.io/dfunkt/xcaddy-docker
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ${{ contains(matrix.arch, 'arm') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
 
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # Needed to upload packages and artifacts
+      id-token: write # Needed to mint the OIDC token necessary to request a Sigstore signing certificate
+      attestations: write # Needed to generate an artifact attestation for a build
 
-    env:
-      PLATFORMS: "['linux/amd64', 'linux/amd64/v3', 'linux/arm64']"
+    strategy:
+      matrix:
+        arch: ["amd64", "arm64"]
 
-    outputs:
-      platforms: ${{ steps.extract-binaries.outputs.PLTF }}
-      source-version: ${{ steps.extract-binaries.outputs.SOURCE_VERSION }}
+    services:
+      registry:
+        image: registry@sha256:1fc7de654f2ac1247f0b67e8a459e273b0993be7d2beda1f3f56fbf1001ed3e7 # v3.0.0
+        ports:
+          - 5000:5000
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
-          images: ${{ env.GHCR_CONTAINER_PATH }}
-          tags: type=raw,value=latest
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+          images: ${{ env.REGISTRY_PACKAGE }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Configure build platforms
-        shell: bash
-        run: |
-          PLATFORMS=$(echo "${{ env.PLATFORMS }}" | tr -d "[' ]")
-          echo "BUILD_PLATFORMS=$PLATFORMS" | tee -a "${GITHUB_ENV}"
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          driver-opts: network=host
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
-          platforms: ${{ env.BUILD_PLATFORMS }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
+          tags: |
+            ${{ env.REGISTRY_PACKAGE }}
+            localhost:5000/dfunkt/xcaddy-docker
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          outputs: type=local,dest=/tmp/xcaddy
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true,compression=zstd,force-compression=true
 
-      - name: Check for extracted binaries
-        id: extract-binaries
+      - name: Export digest
+        env:
+          EXTRACT_CMD: ${{ steps.build.outputs.digest }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          PLATFORMS=$(echo "${{ env.PLATFORMS }}" | tr '/' '_')
-          echo "PLTF=$PLATFORMS" | tee -a "$GITHUB_OUTPUT"
-          echo "SOURCE_VERSION=$(git rev-parse --short HEAD)" | tee -a "${GITHUB_OUTPUT}"
+          mkdir -p "${RUNNER_TEMP}"/digests
+          digest="${EXTRACT_CMD}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
-      - name: Binary cache between jobs
-        uses: actions/cache/save@v4
+      - name: Upload digest
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
-          path: /tmp/xcaddy/
-          key: xcaddy-binaries-${{ steps.extract-binaries.outputs.SOURCE_VERSION }}
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Generate build provenance attestation
-        uses: actions/attest-build-provenance@v1
+      - name: Extract binaries from container
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          # Create output directory
+          mkdir -p ./binaries
+
+          # Create a temporary container and copy binaries
+          CONTAINER_ID=$(docker create localhost:5000/dfunkt/xcaddy-docker:latest@${IMAGE_DIGEST})
+
+          # Copy your binary (adjust the path to match your binary location in the container)
+          docker cp $CONTAINER_ID:/usr/bin/caddy ./binaries/caddy-${MATRIX_ARCH}
+
+          # Clean up
+          docker rm $CONTAINER_ID
+
+      - name: Attest binaries
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
-          subject-name: ${{ env.GHCR_CONTAINER_PATH }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          subject-path: ./binaries/caddy-${{ matrix.arch }}
 
-      - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+      - name: Get short SHA for artefacts
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Upload binaries as artifacts
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
-          format: 'spdx-json'
-          output-file: 'sbom.spdx.json'
-          upload-artifact: false
+          name: caddy-${{ steps.vars.outputs.sha_short }}-linux-${{ matrix.arch }}
+          path: ./binaries/*-${{ matrix.arch }}
 
-      - name: Generate SBOM attestation
-        uses: actions/attest-sbom@v1
-        with:
-          subject-name: ${{ env.GHCR_CONTAINER_PATH }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: 'sbom.spdx.json'
-          push-to-registry: true
-
-  upload-binaries:
+  merge-manifests:
     runs-on: ubuntu-latest
     needs: build-and-push
-    strategy:
-      matrix:
-        platforms: ${{ fromJSON(needs.build-and-push.outputs.platforms) }}
+
+    permissions:
+      packages: write # Needed to upload packages and artifacts
+      id-token: write # Needed to mint the OIDC token necessary to request a Sigstore signing certificate
+      attestations: write # Needed to generate an artifact attestation for a build
 
     steps:
-      - name: Binary cache between jobs
-        uses: actions/cache/restore@v4
+      - name: Download digests
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          path: /tmp/xcaddy/
-          key: xcaddy-binaries-${{ needs.build-and-push.outputs.source-version }}
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
-          name: xcaddy-${{ needs.build-and-push.outputs.source-version }}-${{ matrix.platforms }}
-          path: /tmp/xcaddy/${{ matrix.platforms }}/usr/bin/caddy
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          images: ${{ env.REGISTRY_PACKAGE }}
+          tags: type=raw,value=latest
+
+      - name: Create manifest list, push it and extract digest SHA
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          REGISTRY_PACKAGE: ${{ env.REGISTRY_PACKAGE }}
+        run: |
+          set +e
+          OUTPUT=$(docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${REGISTRY_PACKAGE}@sha256:%s " *) 2>&1)
+
+          STATUS=$?
+
+            if [ $STATUS -ne 0 ]; then
+              echo "Manifest creation failed"
+              echo "$OUTPUT"
+            exit $STATUS
+            fi
+
+            echo "Manifest created"
+            echo "$OUTPUT"
+          set -e
+
+          # Extract digest SHA for subsequent steps
+          GET_DIGEST_SHA="$(echo "$OUTPUT" | grep -oE 'sha256:[a-f0-9]{64}' | head -1)"
+          echo "DIGEST_SHA=${GET_DIGEST_SHA}" | tee -a "${GITHUB_ENV}"
+
+      - name: Attest container image
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.REGISTRY_PACKAGE }}
+          subject-digest: ${{ env.DIGEST_SHA }}
+          push-to-registry: true
